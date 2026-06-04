@@ -1,0 +1,15 @@
+--index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://pypi.org/simple
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+diffusers>=0.36
+transformers>=4.46
+accelerate>=1.0
+gguf>=0.10
+sentencepiece
+protobuf
+pillow
+safetensors
+llama-cpp-python>=0.3
+numpy
+opencv-python
