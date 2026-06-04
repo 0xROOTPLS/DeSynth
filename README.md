@@ -4,7 +4,12 @@ A tool & pipeline for removing OpenAI & Google's SynthID watermark from images.
 This project is intended solely for research, education, and authorized evaluation.
 
 ## Results
+Edge Mode:
+![reference vs desynth (edge mode)](out/comparison_Original_desynth_s8_d0.250_p1_r1.95_edge.png)
+Gaussian Mode (Default):
+![reference vs desynth (gaussian mode)](out/comparison_Original_desynth_s8_d0.250_p1_r1.95.png)
 
+## Metrics
 All scores are input image vs output via the included `compare.py`.
 
 ### Head-to-head on the competitor's own test image (Gemini/Google, 2752×1536)
@@ -19,10 +24,6 @@ All scores are input image vs output via the included `compare.py`.
 | Output resolution      |   2752×1536   |    1501×835      |
 | SynthID verdict        |   not found   |    not found     |
 
-The competitor downscales output to ~55% area; `compare.py` LANCZOS-upscales
-back to compare, which compounds their loss with resampling blur. Even
-discounting that, structural metrics favor our pipeline because the restore
-step carries the original's mid/high-frequency band through unchanged.
 
 ### Our own test image (GPT Image 2.0/OpenAI, 1460×1078)
 
@@ -35,8 +36,9 @@ step carries the original's mid/high-frequency band through unchanged.
 | MAE                    |      **3.82** |     4.08      |
 | SynthID verdict        |   not found   |   not found   |
 
-Edge mode trades a small amount of measurable detail for better perceptual
+* Edge mode trades a small amount of measurable detail for better perceptual
 shape continuity at contours.
+
 
 ## How it works
 
