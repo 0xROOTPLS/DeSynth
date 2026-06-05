@@ -12,7 +12,7 @@ Gaussian Mode (Default):
 ## Metrics
 All scores are input image vs output via the included `compare.py`.
 
-### Head-to-head on the competitor's own test image (Gemini/Google, 2752×1536)
+### Against other research (Gemini/Google, 2752×1536)
 
 | metric                 | our method | [competitor](https://github.com/00quebec/Synthid-Bypass) |
 |------------------------|--------------:|-----------------:|
