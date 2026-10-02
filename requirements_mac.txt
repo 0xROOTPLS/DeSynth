@@ -1,0 +1,15 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch>=2.3.0
+torchvision>=0.18.0
+diffusers>=0.36
+transformers>=4.46
+accelerate>=1.0
+peft>=0.13
+gguf>=0.10
+sentencepiece
+protobuf
+pillow
+safetensors
+numpy
+opencv-python

@@ -89,9 +89,54 @@ ROOT = Path(__file__).parent
 DEFAULT_INPUT = ROOT / "Original.png"
 OUT_DIR = ROOT / "out"
 
-GGUF_TRANSFORMER = ROOT / "qwen-image-2512-Q4_K_M.gguf"
+# Ordered list of GGUF quants to try, best quality first.
+# Each entry is (label, [candidate paths]) — first existing path wins per entry.
+# On OOM the pipeline tears down and retries with the next entry automatically.
+GGUF_FALLBACK_CHAIN: list[tuple[str, list[Path]]] = [
+    ("Q4_K_M (~13 GB)", [
+        ROOT / "Qwen-Image-2512-Q4_K_M.gguf",
+        ROOT / "qwen-image-2512-Q4_K_M.gguf",   # README-suggested lowercase
+    ]),
+    ("Q2_K_M (~7 GB)", [
+        ROOT / "Qwen-Image-2512-Q2_K_M.gguf",
+        ROOT / "qwen-image-2512-Q2_K_M.gguf",
+    ]),
+]
+
+def _resolve_gguf(candidates: list[Path]) -> Path | None:
+    """Return the first path in candidates that exists on disk, or None."""
+    return next((p for p in candidates if p.exists()), None)
+
+# Default transformer = best available quant right now (used by --transformer default).
+GGUF_TRANSFORMER = next(
+    (p for _, cands in GGUF_FALLBACK_CHAIN for p in cands if p.exists()),
+    GGUF_FALLBACK_CHAIN[0][1][0],  # fallback to first path even if missing (gives clear error)
+)
 LIGHTNING_LORA = ROOT / "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
 EMBEDS_CACHE = ROOT / "embeds_cache.pt"
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """Return True for any out-of-memory error across CUDA, MPS, and CPU."""
+    if isinstance(exc, MemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return any(k in msg for k in ("out of memory", "oom", "memory allocation"))
+    # torch.cuda.OutOfMemoryError is a subclass of RuntimeError, already covered.
+    return False
+
+
+def _free_pipeline(pipe) -> None:
+    """Aggressively release a pipeline and clear device caches."""
+    import gc
+    del pipe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 # HF repo used only for tiny configs and the ~250MB VAE.
 QWEN_IMAGE_REPO = "Qwen/Qwen-Image"
@@ -106,6 +151,28 @@ DEFAULT_DENOISE = 0.25
 # back maximum detail from the original without dragging the watermark along.
 DEFAULT_RESTORE_SIGMA = 1.95
 
+# ---------------------------------------------------------------------------
+# Device / dtype selection — CUDA > MPS (Apple Silicon) > CPU
+# ---------------------------------------------------------------------------
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    COMPUTE_DTYPE = torch.bfloat16   # native on Ampere+
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+    # PyTorch 2.14 has solid bfloat16 MPS coverage. More importantly, the
+    # diffusers pipeline's image preprocessor naturally produces bfloat16
+    # tensors on MPS — using float16 here causes a dtype mismatch in the
+    # VAE encoder (Input bfloat16 vs bias float16). Keep bfloat16 throughout.
+    COMPUTE_DTYPE = torch.bfloat16
+    # Disable PyTorch's conservative MPS OOM guard (~70% threshold) so macOS's
+    # own memory compressor and SSD swap can manage pressure instead.
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+else:
+    DEVICE = "cpu"
+    COMPUTE_DTYPE = torch.float32    # bf16/fp16 are slow on CPU without HW support
+
+print(f"[device] {DEVICE}  dtype={COMPUTE_DTYPE}")
+
 
 def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2ImgPipeline:
     for p in (transformer_path, LIGHTNING_LORA, EMBEDS_CACHE):
@@ -114,7 +181,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
                 f"{p}\n(Run `python precompute_embeds.py` first if embeds_cache.pt is missing.)"
             )
 
-    dtype = torch.bfloat16
+    dtype = COMPUTE_DTYPE
 
     # Offline if cached; download once if not.
     def _load(loader, **kwargs):
@@ -126,9 +193,9 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
 
     transformer = _load(
         QwenImageTransformer2DModel.from_single_file,
-        pretrained_model_link_or_path=str(transformer_path),
+        pretrained_model_link_or_path_or_dict=str(transformer_path),
         quantization_config=GGUFQuantizationConfig(compute_dtype=dtype),
-        torch_dtype=dtype,
+        dtype=dtype,
         config=QWEN_IMAGE_REPO,
         subfolder="transformer",
     )
@@ -137,7 +204,7 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         AutoencoderKLQwenImage.from_pretrained,
         pretrained_model_name_or_path=QWEN_IMAGE_REPO,
         subfolder="vae",
-        torch_dtype=dtype,
+        dtype=dtype,
     )
 
     # No text encoder loaded — embeds are precomputed.
@@ -148,15 +215,37 @@ def build_pipeline(transformer_path: Path = GGUF_TRANSFORMER) -> QwenImageImg2Im
         vae=vae,
         text_encoder=None,
         tokenizer=None,
-        torch_dtype=dtype,
+        dtype=dtype,
     )
 
-    # fuse_lora doesn't work with GGUF-packed base weights, use runtime adapter.
-    pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
+    # Load LoRA via safetensors mmap so its 1.6 GB stays SSD-backed (same
+    # strategy as the GGUF weights). safetensors.torch.load_file() memory-maps
+    # the file by default; tensors are only paged into RAM when accessed.
+    try:
+        from safetensors.torch import load_file as _st_load
+        _lora_sd = _st_load(str(LIGHTNING_LORA), device="cpu")
+        pipe.load_lora_weights(_lora_sd, adapter_name="lightning")
+    except Exception:
+        # Fallback: let diffusers handle it normally (heap allocation).
+        pipe.load_lora_weights(str(LIGHTNING_LORA), adapter_name="lightning")
     pipe.set_adapters(["lightning"], adapter_weights=[0.8])
 
-    # Sequential offload is the only mode that fits a 10GB Q4 transformer in 8GB.
-    pipe.enable_sequential_cpu_offload()
+    # Offload strategy depends on available hardware.
+    #   CUDA:     sequential offload — moves one layer at a time, fits 13GB GGUF
+    #             in 8 GB VRAM (tested config from the original author).
+    #   MPS/CPU:  model-level offload — accelerate moves whole sub-modules;
+    #             sequential offload's internals are CUDA-only in diffusers.
+    #             On CPU this still runs entirely in system RAM.
+    if DEVICE == "cuda":
+        pipe.enable_sequential_cpu_offload()
+    else:
+        # enable_model_cpu_offload falls back to CPU→device per sub-module,
+        # which accelerate supports on MPS as of accelerate>=0.26.
+        try:
+            pipe.enable_model_cpu_offload(device=DEVICE)
+        except TypeError:
+            # Older accelerate doesn't accept 'device' kwarg — move manually.
+            pipe.enable_model_cpu_offload()
     pipe.vae.enable_tiling()
 
     return pipe
@@ -268,24 +357,83 @@ def main() -> None:
     image = load_image(str(input_path))
     print(f"input: {input_path.name}  size={image.size}")
 
-    pipe = build_pipeline(transformer_path=args.transformer)
     embeds = torch.load(EMBEDS_CACHE, map_location="cpu", weights_only=False)
     print(f"embeds: pos={tuple(embeds['prompt_embeds'].shape)} neg={tuple(embeds['negative_prompt_embeds'].shape)}")
 
+    # Build the fallback sequence to attempt.
+    # If --transformer was given explicitly, respect it and skip auto-fallback.
+    explicit_transformer = args.transformer != GGUF_TRANSFORMER
+    if explicit_transformer:
+        attempt_chain = [(args.transformer.stem, args.transformer)]
+    else:
+        # Walk GGUF_FALLBACK_CHAIN; skip entries whose file isn't on disk yet.
+        attempt_chain = []
+        for label, cands in GGUF_FALLBACK_CHAIN:
+            p = _resolve_gguf(cands)
+            if p is not None:
+                attempt_chain.append((label, p))
+        if not attempt_chain:
+            raise SystemExit(
+                "No GGUF transformer found. Download at least one quant:\n"
+                "  Qwen-Image-2512-Q4_K_M.gguf  (~13 GB, best quality)\n"
+                "  Qwen-Image-2512-Q2_K_M.gguf  (~7 GB,  fallback)\n"
+                "from https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF"
+            )
+
     OUT_DIR.mkdir(exist_ok=True)
     stem = input_path.stem
-    # Include the transformer file tag only when it's not the default — keeps
-    # default filenames short, makes alt-model outputs distinguishable.
-    model_tag = "" if args.transformer == GGUF_TRANSFORMER else f"_{args.transformer.stem}"
-    for denoise in args.denoise:
-        clean_pil = run_once(
-            pipe, image, embeds,
-            denoise=denoise, steps=args.steps, seed=args.seed, passes=args.passes,
-        )
-        tag = f"_s{args.steps}_d{denoise:.3f}_p{args.passes}{model_tag}"
 
+    pipe = None
+    used_label = None
+    used_path = None
+
+    for label, transformer_path in attempt_chain:
+        if pipe is not None:
+            _free_pipeline(pipe)
+            pipe = None
+
+        print(f"[quant] trying {label}  ({transformer_path.name})")
+        try:
+            pipe = build_pipeline(transformer_path=transformer_path)
+            # Run a single denoise pass to confirm the quant fits in memory
+            # before committing to the full sweep.
+            _ = run_once(
+                pipe, image, embeds,
+                denoise=args.denoise[0], steps=args.steps,
+                seed=args.seed, passes=args.passes,
+            )
+            used_label = label
+            used_path = transformer_path
+            break   # success — keep this pipe for remaining denoise values
+        except BaseException as exc:
+            if _is_oom(exc) and not explicit_transformer:
+                next_entries = attempt_chain[attempt_chain.index((label, transformer_path)) + 1:]
+                if next_entries:
+                    print(f"[OOM] {label} ran out of memory — retrying with {next_entries[0][0]}")
+                    continue
+            raise   # non-OOM error or no fallback left — propagate
+
+    if pipe is None or used_path is None:
+        raise SystemExit("All quants exhausted without success.")
+
+    # Include the transformer quant tag when it differs from the best available
+    # (i.e. we fell back, or --transformer was explicit).
+    default_path = attempt_chain[0][1] if attempt_chain else used_path
+    model_tag = "" if used_path == default_path else f"_{used_path.stem}"
+
+    # The first denoise value was already run above to probe memory; reuse it.
+    denoise_queue = list(args.denoise)
+    first_denoise = denoise_queue.pop(0)
+
+    def _save(clean_pil, denoise):
+        tag = f"_s{args.steps}_d{denoise:.3f}_p{args.passes}{model_tag}"
         if args.restore:
-            final_pil = _restore(clean_pil, image, sigma=args.restore_sigma, mode=args.restore_mode, unsharp_strength=args.unsharp)
+            final_pil = _restore(
+                clean_pil, image,
+                sigma=args.restore_sigma,
+                mode=args.restore_mode,
+                unsharp_strength=args.unsharp,
+            )
             mode_tag = "" if args.restore_mode == "gaussian" else f"_{args.restore_mode}"
             final_path = OUT_DIR / f"{stem}_desynth{tag}_r{args.restore_sigma:g}{mode_tag}.png"
             final_pil.save(final_path)
@@ -298,6 +446,16 @@ def main() -> None:
             final_path = OUT_DIR / f"{stem}_desynth{tag}.png"
             clean_pil.save(final_path)
             print(f"  -> {final_path.relative_to(ROOT)}")
+
+    # The probe run result was discarded (we only used it to check for OOM).
+    # Re-run the first denoise value properly and save, then handle the rest.
+    for denoise in [first_denoise] + denoise_queue:
+        clean_pil = run_once(
+            pipe, image, embeds,
+            denoise=denoise, steps=args.steps,
+            seed=args.seed, passes=args.passes,
+        )
+        _save(clean_pil, denoise)
 
 
 if __name__ == "__main__":
