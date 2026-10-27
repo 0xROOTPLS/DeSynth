@@ -4,15 +4,13 @@ A tool & pipeline for removing OpenAI & Google's SynthID watermark from images.
 This project is intended solely for research, education, and authorized evaluation.
 
 ## Results
-Edge Mode:
-![reference vs desynth (edge mode)](out/comparison_Original_desynth_s8_d0.250_p1_r1.95_edge.png)
-Gaussian Mode (Default):
-![reference vs desynth (gaussian mode)](out/comparison_Original_desynth_s8_d0.250_p1_r1.95.png)
+![reference vs desynth](out/comparison_Original_desynth_s32_d0.156_p1_r2.4_bw12.png)
 
 ## Metrics
 All scores are input image vs output via the included `compare.py`.
 
 ### Against other research (Gemini/Google, 2752×1536)
+Measured with the previous Qwen-Image 2512 pipeline.
 
 | metric                 | our method | [competitor](https://github.com/00quebec/Synthid-Bypass) |
 |------------------------|--------------:|-----------------:|
@@ -27,17 +25,14 @@ All scores are input image vs output via the included `compare.py`.
 
 ### Our own test image (GPT Image 2.0/OpenAI, 1460×1078)
 
-| metric                 | gaussian (default) | edge mode |
-|------------------------|--------------:|--------------:|
-| PSNR                   |  **32.47 dB** |   31.47 dB    |
-| SSIM                   |     **0.956** |     0.948     |
-| SSIM (low-frequency)   |     **0.959** |     0.955     |
-| SSIM (high-frequency)  |     **0.991** |     0.984     |
-| MAE                    |      **3.82** |     4.08      |
-| SynthID verdict        |   not found   |   not found   |
-
-* Edge mode trades a small amount of measurable detail for better perceptual
-shape continuity at contours.
+| metric                 | default       |
+|------------------------|--------------:|
+| PSNR                   |  **35.14 dB** |
+| SSIM                   |     **0.969** |
+| SSIM (low-frequency)   |     **0.971** |
+| SSIM (high-frequency)  |     **0.995** |
+| MAE                    |      **2.99** |
+| SynthID verdict        |   not found   |
 
 
 ## How it works
@@ -45,11 +40,11 @@ shape continuity at contours.
 ```mermaid
 flowchart TD
     A["Original.png"]
-    B["Qwen-Image GGUF Q4<br>+ Lightning 4-step LoRA"]
-    B_note["2 Lightning steps\n(strength 0.25)"]
+    B["Qwen-Image 2.1 GGUF Q8_0<br>img2img at 1280²"]
+    B_note["last 5 of 32 steps\n(strength 0.156)"]
     C["Frequency-domain restore<br>low_clean + high_orig"]
-    C_note["Gaussian split, sigma=1.95<br>low band from clean<br>high band from Original"]
-    D["[output]\nNAME_desynth_r1.95.png"]
+    C_note["Butterworth-12 split, sigma-equiv 2.4<br>low band from clean<br>high band from Original"]
+    D["[output]\nNAME_desynth_s32_d0.156_p1_r2.4_bw12.png"]
 
     A --> B
     B -- "clean: no SynthID, blurry-ish" --> C
@@ -63,12 +58,12 @@ flowchart TD
 
 ## Usage
 
-Download the two model files into the repo root:
+Download the transformer into the repo root:
 
-| file                                                      | size   | source |
-|-----------------------------------------------------------|--------|--------|
-| `qwen-image-2512-Q4_K_M.gguf`                             | ~13 GB | [Frederic75/Qwen-Image-2512-GGUF](https://huggingface.co/Frederic75/Qwen-Image-2512-GGUF) |
-| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors`  | ~1.6 GB | [lightx2v/Qwen-Image-2512-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning) |
+| file                                | size    | source |
+|-------------------------------------|---------|--------|
+| `qwen-image-2.1-Q8_0.gguf`          | ~7.6 GB | [unsloth/Qwen-Image-2.1-GGUF](https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF) |
+| `pytorch_lora_weights.safetensors`  | ~67 MB  | [lightx2v/Qwen-Image-2.1-Lightning](https://huggingface.co/lightx2v/Qwen-Image-2.1-Lightning) (optional, only for `--lightning-weight`) |
 
 
 ### Run
@@ -78,24 +73,27 @@ python desynth.py                          # processes original.png
 python desynth.py path\to\image.png        # processes any input
 ```
 
-Output: `out/<name>_desynth_s8_d0.250_p1_r1.95.png`. Random seed per run by
-default. First run downloads ~250 MB of VAE + configs from Hugging Face
-and caches them.
+Output: `out/<name>_desynth_s32_d0.156_p1_r2.4_bw12.png`. Random seed per run by
+default. First run downloads ~1.4 GB of VAE, processor and configs from
+Hugging Face and caches them.
 
 ### Flags
 
 | flag                  | default | when to use |
 |-----------------------|---------|-------------|
 | `--seed N`            | random  | reproducible runs |
-| `--denoise X [X X]`   | 0.25    | sweep denoise |
-| `--steps N`           | 8       | per-pass step count |
+| `--denoise X [X X]`   | 0.15625 | sweep denoise (5/32) |
+| `--steps N`           | 32      | per-pass step count |
 | `--passes N`          | 1       | iterate img2img |
-| `--restore-sigma X`   | 1.95    | tune detail restore |
-| `--restore-mode M`    | gaussian | `edge` for shape-coherent contours |
+| `--restore-sigma X [X X]` | 2.4 | tune / sweep detail restore (gaussian/edge default 0.8) |
+| `--restore-mode M`    | butterworth | `gaussian` for the old soft crossover; `edge` for shape-coherent contours |
+| `--restore-order N`   | 12      | butterworth steepness; sigma means the Gaussian with the same crossover point |
 | `--unsharp X`         | 0.0     | post-restore sharpen; 0.2 is the perceptual sweet spot |
 | `--no-restore`        | off     | skip the frequency restore step |
 | `--keep-intermediate` | off     | save the pre-restore clean output |
-| `--transformer PATH`  | Q4_K_M  | try a different GGUF quant |
+| `--transformer PATH`  | Q8_0    | try a different GGUF quant |
+| `--resolution N`      | 1280    | sampling area N×N px (aspect follows input); higher keeps more detail |
+| `--lightning-weight X`| 0       | Lightning LoRA strength (0.8 if used); 0 = off |
 
 ### Quality check
 
@@ -112,9 +110,10 @@ histogram correlation.
 |-----------------------------------------------------------|------------------------------------------------------------|
 | `desynth.py`                                              | main pipeline: img2img + restore in one call               |
 | `compare.py`                                              | similarity metrics between two images                      |
-| `embeds_cache.pt`                                         | cached prompt embeddings (~430 KB)            |
-| `qwen-image-2512-Q4_K_M.gguf`                             | Qwen-Image transformer, GGUF Q4 quant (~13 GB)             |
-| `Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors`  | 4-step Lightning distillation LoRA (~1.6 GB)               |
+| `precompute_embeds.py`                                    | rebuilds `embeds_cache.pt` (downloads ~17.5 GB text encoder) |
+| `embeds_cache.pt`                                         | cached prompt embeddings (~200 KB)            |
+| `qwen-image-2.1-Q8_0.gguf`                                | Qwen-Image 2.1 transformer, GGUF Q8_0 quant (~7.6 GB)      |
+| `pytorch_lora_weights.safetensors`                        | Qwen-Image 2.1 Lightning LoRA (~67 MB, optional)           |
 
 ## Hardware Requirements
 
@@ -123,10 +122,10 @@ Sequential CPU offload is required with < 12GB VRAM
 
 ## Known limitations
 
-- Lightning's 4-step distillation is the source of most of the residual
-  drift.  
-  (Dropping it for proper 20+ step sampling would likely tighten metrics further at the cost of 5x longer
-  runs.)
+- The default restore cutoff (2.4) sits one step under where SynthID returns
+  (2.6 passes, 2.8 fails). Other `--resolution`, `--steps`, `--denoise` or
+  `--lightning-weight` settings move that limit.
+- `edge` mode is untested with Qwen-Image 2.1.
 
 ## Credits
 
@@ -134,4 +133,4 @@ Baseline workflow and watermark hypothesis from
 [00quebec/Synthid-Bypass](https://github.com/00quebec/Synthid-Bypass).  
 This pipeline reimplements the core idea in plain Python without ComfyUI,
 ControlNet, or the face-detail path, and replaces the heavier redraw with a
-two-step minimum denoise + frequency-domain restore.
+five-step minimum denoise + frequency-domain restore.

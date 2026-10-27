@@ -2,14 +2,15 @@
 --extra-index-url https://pypi.org/simple
 torch==2.7.1+cu128
 torchvision==0.22.1+cu128
-diffusers>=0.36
-transformers>=4.46
+diffusers>=0.42
+transformers>=5.17
 accelerate>=1.0
+peft>=0.20
 gguf>=0.10
 sentencepiece
 protobuf
 pillow
 safetensors
-llama-cpp-python>=0.3
+brotli>=1.2
 numpy
 opencv-python
