@@ -1,5 +1,5 @@
-# Quantitative similarity metrics between two images. No model downloads —
-# pure pixel-level + structural metrics from numpy/skimage/opencv.
+# Quantitative similarity metrics between two images. No model downloads.
+# Pure pixel-level + structural metrics from numpy/skimage/opencv.
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def metrics(a: np.ndarray, b: np.ndarray) -> dict:
     ssim_low = float(ssim(low_a.clip(0, 255).astype(np.uint8),
                           low_b.clip(0, 255).astype(np.uint8),
                           channel_axis=2, data_range=255))
-    # High-pass is centered around 0 with small range — shift to [0,255] for SSIM.
+    # High-pass is centered around 0 with small range; shift to [0,255] for SSIM.
     ha = (high_a + 128).clip(0, 255).astype(np.uint8)
     hb = (high_b + 128).clip(0, 255).astype(np.uint8)
     ssim_high = float(ssim(ha, hb, channel_axis=2, data_range=255))
